@@ -1,0 +1,499 @@
+#!/bin/bash
+
+function print_usage_and_exit {
+	/bin/echo "usage: ${progname} <job_prefix> -a <account> -c <coordinates>" >&2
+	/bin/echo "           -p <topology> [ -d ] [ -e <email_address> ] [ -m <mem_per_cpu> ]" >&2
+	/bin/echo "           [ -n <num_stages> ] [ -t <walltime_per_stage> ]" >&2
+	exit $1
+}
+
+
+function print_help_and_exit {
+
+	cat << ENDHELP
+      ${progname}
+      
+      This script will take a specified job name, coordinate (.gro) and
+      topology (.top) files, and submit a series of GROMACS molecular
+      dynamics simulations.
+      
+      Usage: ${progname} <job_prefix> -a <account> -c <init_coordinates>
+                   -p <topology> [ -d ] [ -e <email_address> ]
+		   [ -m <mem_per_cpu> ] [ -n <num_stages> ]
+                   [ -t <walltime_per_stage> ]
+             ${progname} -h
+     
+      -a <account>, --account=<account>
+
+            Tell the script what account code (project code) you would like to
+            use.
+      
+      -c <init_coordinates>, --coordinates=<init_coordinates>
+            
+            Tell the script what GROMACS format coordinate file you would like
+            to use as the initial coordinates.
+      
+      -d, --data-fabric
+
+            Transfer the results of each stage to the NeSI Data Fabric upon
+	    that stage's successful completion.
+      
+      -e, --email=<email_address>
+      
+            The email address to which to send job notifications. If not
+	    provided, no job notifications will be sent by the scheduler.
+
+      -h, --help
+
+            Print this help and exit.
+      
+      -m, --mem-per-cpu=<memory>
+      
+            Tell the script how much memory to allocate to each CPU core
+	    (default 4 GB). If no units are given, MB will be assumed.
+
+      -n <num_stages>, --num-stages=<num_stages>
+
+            Tell the script how many stages of MD simulation you would like
+            to run. The default is 1.
+	
+      -p <topology>, --topology=<topology>
+
+            Tell the script what GROMACS format topology file you would like
+            to use.
+
+      -t <walltime>, --walltime=<walltime>
+
+            Tell the script how long you want each stage to be run for (the
+            maximum wall time). The default is 48 hours.
+
+ENDHELP
+}
+
+function write_mdp_file {
+
+	# This function writes the Gromacs simulation configuration (*.mdp) file.
+	#
+	# Positional parameters:
+	#
+	# $1 = stage number (1, 2, 3, etc.)
+	# $2 = stage name (stage001, stage002, stage003, etc.)
+
+	let "tinit = 3500 * ($1-1)"
+	cat << EOMDP >> ${workdir}/md_prod_$2.mdp
+title           = Production MD of ${jobprefix}_${stagename} -- stage $1 of ${numstages}
+cpp             = /usr/bin/cpp
+constraints     = all-bonds
+integrator      = md
+dt              = 0.002      ; timestep in ps
+nsteps          = 1750000    ; total 3.5 ns per stage
+tinit           = ${tinit}.0 ; initial time in ps
+nstcomm         = 100
+nstxout         = 1000
+nstvout         = 1000
+nstfout         = 0
+nstlog          = 100
+nstenergy       = 100
+nstlist         = 10
+ns_type         = grid
+rlist           = 0.9
+coulombtype     = PME
+rcoulomb        = 0.9
+rvdw            = 1.4
+fourierspacing  = 0.12
+fourier_nx      = 0
+fourier_ny      = 0
+fourier_nz      = 0
+pme_order       = 4
+ewald_rtol      = 1e-5
+optimize_fft    = yes
+; Berendsen temperature coupling is on in two groups
+Tcoupl          = berendsen
+tau_t           = 0.1     0.1
+tc-grps         = protein sol
+ref_t           = 300     300
+; Pressure coupling is on
+Pcoupl          = berendsen
+tau_p           = 0.5
+compressibility = 4.5e-5
+ref_p           = 1.0
+; Velocity generation could be requested based on T = 300 K, but isn't
+gen_vel         = no
+; gen_temp        = 300.0
+; gen_seed        = -1 ; check seed!
+EOMDP
+}
+
+function write_shell_script_component {
+	# This function writes the shell script for each job - the part that
+	# will actually be executed.
+	# 
+	# Positional parameters:
+	# First argument = stage name (stage001, stage002, etc.)
+	# Second argument = name of previous stage (stage000, stage001, etc.)
+	# Third argument = stage number (1, 2, 3, etc.)
+	# 
+	# If this is the first stage, then stuff will be written to the transfer
+	# script so that when the transfer script is executed the first thing it
+	# will do is set up a new iRODS certificate. Because this only needs to be
+	# done once per running of the transfer script, it need only happen for
+	# the first MD stage.
+	# 
+	# If this is the last stage, copy the output files from it as well when it
+	# finishes.
+	# 
+	# If this is any stage (including the first and the last), copy the output
+	# files from the *previous* stage. In all stages, grompp and mdrun_mpi will
+	# also be run.
+
+	cat << EOSS
+
+module load GROMACS/4.6.5-intel-2015a-hybrid
+
+srun grompp \\
+	-f md_prod_$1.mdp \\
+	-c $2.gro \\
+	-p ${topology_base} \\
+	-o $1.tpr && \\
+echo "Note: Simulation logs will be written to $1.log" && \\
+srun mdrun_mpi \\
+	-s $1.tpr \\
+	-o $1.trr \\
+	-c $1.gro \\
+	-e $1.edr \\
+	-g $1.log \\
+	-v        \\
+EOSS
+	if ${data_fabric}
+	then
+		cat << EOSS
+	&& \\
+EOSS
+		# On the first stage, set up an iRODS directory
+		# on the Data Fabric
+		if [ $3 -eq 1 ]
+		then
+			cat << EOSS
+cat << EOTFR >> ${tfrcmd}
+#!/bin/sh
+
+echo ''
+echo 'You will now be prompted for your iRODS password. By authenticating, you will'
+echo 'generate an iRODS certificate that will last for several months. This will be'
+echo 'used to copy data to and from the Data Fabric.'
+echo ''
+iinit
+echo ''
+echo 'Please specify an iRODS (Data Fabric) destination directory.'
+echo 'Your home directory on the Data Fabric will be used as a prefix. The'
+echo 'destination directory will have a "Production" directory created within'
+echo 'it.'
+echo ''
+echo -n 'Directory: '
+read df_dest_dir_parent
+df_dest_dir=\${df_dest_dir_parent}/Production
+imkdir -p \${df_dest_dir}
+echo ''
+EOTFR
+
+chmod +x ${tfrcmd}
+EOSS
+		# On all but the first stage, queue a copy of the preceding
+		# stage's output to the Data Fabric
+		else
+			cat << EOSS
+cat << EOTFR >> ${tfrcmd}
+${iput_command} md_prod_$2.mdp \${df_dest_dir}
+${iput_command} $2.tpr \${df_dest_dir}
+${iput_command} $2.trr \${df_dest_dir}
+${iput_command} $2.edr \${df_dest_dir}
+${iput_command} $2.log \${df_dest_dir}
+${iput_command} $2.out \${df_dest_dir}
+${iput_command} $2.err \${df_dest_dir}
+EOTFR
+EOSS
+		fi
+		# On the last stage, queue a copy of its own output to
+		# the Data Fabric
+		if [ $3 -eq $numstages ]
+		then
+			cat << EOSS
+
+cat << EOTFR >> ${tfrcmd}
+${iput_command} ${topology_full} \${df_dest_dir}
+${iput_command} md_prod_$1.mdp \${df_dest_dir}
+${iput_command} $1.gro \${df_dest_dir}
+${iput_command} $1.tpr \${df_dest_dir}
+${iput_command} $1.trr \${df_dest_dir}
+${iput_command} $1.edr \${df_dest_dir}
+${iput_command} $1.log \${df_dest_dir}
+${iput_command} ${jobprefix}_$1.out \${df_dest_dir}
+${iput_command} ${jobprefix}_$1.err \${df_dest_dir}
+EOTFR
+EOSS
+		fi
+		# On any stage (even the first), queue a copy of the
+		# preceding stage's coordinate file to the Data Fabric
+		cat << EOSS
+
+cat << EOTFR >> ${tfrcmd}
+${iput_command} $2.gro \${df_dest_dir}
+EOTFR
+EOSS
+}
+
+function write_slurm_component {
+
+	# Write the header to the Slurm job command file. Properties set here
+	# will, as far as possible, be applied to all jobs.
+	# 
+	# Important ones to be aware of:
+	# - each job will request 4 GB of RAM per task
+	# - you may only run on Sandy Bridge nodes
+	#
+	# Positional parameters:
+	# $1 = current stage name (stage001, stage002, etc.)
+	# $2 = previous job ID
+
+	cat << EOSLURM
+#!/bin/bash
+
+#SBATCH --job-name      ${jobprefix}_$1
+#SBATCH --account       ${account}
+#SBATCH --time          ${walltime}
+#SBATCH --ntasks        8
+#SBATCH --cpus-per-task 1
+#SBATCH --mem-per-cpu   ${mem_per_cpu}
+#SBATCH --constraint    sb 
+#SBATCH --output        $1.out
+#SBATCH --error         $1.err
+EOSLURM
+	if [ -n "${email_address}" ]
+	then
+		echo "#SBATCH --mail-type     ALL"
+		echo "#SBATCH --mail-user     ${email_address}"
+	if [ "$1" != "stage001" ]
+	then
+		echo "#SBATCH --dependency    afterok:$2"
+	fi
+}
+
+#######################
+##                   ##
+##  THE MAIN SCRIPT  ##
+##                   ##
+#######################
+
+# Ensure that we don't have any uninitialised variables in this script
+set -u
+
+# Set the program name for later use
+progname=$(basename $0)
+
+# Set some default values
+currdir=$(pwd -P)
+datafabric=false
+jobprefix=""
+mem_per_cpu="4G"
+numstages=1
+walltime="48:00:00"
+
+ARGS=$(getopt -o a:c:de:hm:n:p:t: -l "account:,coordinates:,data-fabric,email:,help,mem-per-cpu:,num-stages:,topology:,walltime:" -n "${progname}" -- "$@");
+
+#Bad arguments
+if [ $? -ne 0 ]
+then
+	exit 1
+fi
+
+eval set -- "$ARGS";
+
+while true
+do
+	case "$1" in
+	-a|--account)
+		shift
+		if [ -n "$1" ]
+		then
+			account=$1
+			shift
+		fi
+		;;
+	-c|--coordinates)
+		shift
+		if [ -n "$1" ]
+		then
+			coordinates=$1
+			shift
+		fi
+		;;
+	-d|--data-fabric)
+		shift
+		data_fabric=true
+	-e|--email)
+		shift
+		if [ -n "$1" ]
+		then
+			email_address=$1
+			shift
+		fi
+	-h|--help)
+		shift
+		print_help_and_exit
+		;;
+	-m|--mem-per-cpu)
+		shift
+		if [ -n "$1" ]
+		then
+			mem_per_cpu=$1
+			shift
+		fi
+	-n|--num-stages)
+		shift
+		if [ -n "$1" ]
+		then
+			numstages=$1
+			shift
+		fi
+		;;
+	-p|--topology)
+		shift
+		if [ -n "$1" ]
+		then
+			topology=$1
+			shift
+		fi
+		;;
+	-t|--walltime)
+		shift
+		if [ -n "$1" ]
+		then
+			walltime=$1
+			shift
+		fi
+		;;
+	--)
+		shift
+		break
+		;;
+	esac
+done
+
+# Die if the number of arguments is wrong
+if [ $# -gt 1 ]
+then
+	print_usage_and_exit 1
+elif [ $# -eq 1 ]
+then
+	jobprefix=$1
+fi
+
+# If the number of stages is not a positive integer, die.
+if [ ${numstages} -le 0 ]
+then
+	/bin/echo "${progname}: \"$numstages\" is not a positive integer" >&2
+	exit 1
+fi
+
+# If the walltime is not of an acceptable format, die.
+if [[ ! "${walltime}" =~ ([0-9]+-)?[0-9]+:[0-9][0-9]:[0-9][0-9] ]]
+then
+	/bin/echo "${progname}: wall time should be of the form hhh:mm:ss or ddd-hhh:mm:ss" >&2
+	exit 1
+fi
+
+if [ -z "${jobprefix}" ]
+then
+	echo "No job name prefix has been specified."
+elif [ ${#jobprefix} -gt 12 ]
+then
+	echo "Job prefix \"${jobprefix}\" is too long."
+	jobprefix=""
+fi
+
+if [ -z "${jobprefix}" ]
+then
+	prompt=$(/bin/basename "${currdir}" | /bin/cut -c 1-8)
+	while [ -z "${jobprefix}" ]
+	do
+		echo -n "Please enter a job name prefix: [${prompt}] "
+		read answer
+		if [ -z "${answer}" ]
+		then
+			jobprefix="${prompt}"
+		elif [ ${#answer} -gt 12 ]
+		then
+			echo "Prefix too long. Please choose another, at most 12 characters."
+		elif [[ "${answer}" =~ [[:space:]] ]]
+		then
+			echo "Spaces are not permitted. Please choose a different prefix."
+		else
+			jobprefix="${answer}"
+		fi
+	done	
+fi
+
+# Command to copy a file to the Data Fabric using iRODS software
+iput_command="iput -N 4 -K -P -V"
+
+# Set the full path, the job name, and make a directory
+# called "Production" in the working directory.
+# This means any existing "Production" directory should be checked
+# to make sure nothing important will be used or overwritten inappropriately.
+workdir="${currdir}/Production"
+tfrcmd="${workdir}/transfer_script"
+rm -f "${tfrcmd}"
+
+for inputfile in ${coordinates} ${topology}
+do
+	if [ ! -e "${inputfile}" ]
+	then
+		/bin/echo "${progname}: ${inputfile}: no such file or directory" >&2
+		exit 1
+	elif [ ! -f "${inputfile}" ]
+	then
+		/bin/echo "${progname}: ${inputfile}: not a file" >&2
+		exit 1
+	elif [ ! -r "${inputfile}" ]
+	then
+		/bin/echo "${progname}: ${inputfile}: permission denied" >&2
+		exit 1
+	fi
+done
+
+if [ -d "${workdir}" ]
+then
+	# Back up any existing directory with the same name
+	# as the proposed working directory. If a directory
+	# with the same name as the backup directory also
+	# exists, prompt.
+	/bin/mv -i "${workdir}" "${workdir}.bak"
+fi
+coordinates_full=$(/bin/readlink -f "${coordinates}")
+topology_full=$(/bin/readlink -f "${topology}")
+topology_base=$(/bin/basename ${topology})
+/bin/mkdir -p "${workdir}"
+/bin/ln -s "${coordinates_full}" "${workdir}/stage000.gro"
+/bin/ln -s "${topology_full}" "${workdir}/${topology_base}"
+
+prevjobid=0
+prevstagename="stage000"
+for i in $(/usr/bin/seq 1 ${numstages})
+do
+	stagename=$(/usr/bin/printf "stage%03d\n" $i)
+	jobfile="${workdir}/${stagename}.sl"
+	write_slurm_component ${stagename} ${prevjobid} > ${jobfile}
+	write_shell_script_component ${stagename} ${prevstagename} $i >> ${jobfile}
+	write_mdp_file $i ${stagename}
+
+	# Set this job ID for use in subsequent dependencies
+	submission_output=$(sbatch ${jobfile})
+	if [[ "${submission_output}" =~ ^Submitted[[:space:]]batch[[:space:]]job[[:space:]] ]]
+	then
+		prevjobid=$(/bin/echo "${submission_output}" | /bin/sed -e 's/Submitted batch job //')
+	else
+		/bin/echo "${progname}: submission of stage ${i} of ${numstages} failed -- stopping" >&2
+		exit 1
+	fi
+	prevstagename="${stagename}"
+done
