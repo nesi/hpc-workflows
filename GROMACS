@@ -2,11 +2,11 @@
 
 function print_usage_and_exit {
 	/bin/echo "usage: ${progname} <job_prefix> -a <account> -c <coordinates>" >&2
-	/bin/echo "           -p <topology> [ -d ] [ -e <email_address> ] [ -m <mem_per_cpu> ]" >&2
-	/bin/echo "           [ -n <num_stages> ] [ -t <walltime_per_stage> ]" >&2
+	/bin/echo "           -p <topology> [ -d ] [ -e <email_address> ]" >&2
+	/bin/echo "           [ -f <first_stage> ] [ -k <num_cores> ] [ -m <mem_per_cpu> ]" >&2
+	/bin/echo "           [ -n <num_stages> ] [ -r ] [ -t <walltime_per_stage> ] [ -y ]" >&2
 	exit $1
 }
-
 
 function print_help_and_exit {
 
@@ -19,8 +19,9 @@ function print_help_and_exit {
       
       Usage: ${progname} <job_prefix> -a <account> -c <init_coordinates>
                    -p <topology> [ -d ] [ -e <email_address> ]
+		   [ -f <first_stage> ] [ -k <num_cores> ]
 		   [ -m <mem_per_cpu> ] [ -n <num_stages> ]
-                   [ -t <walltime_per_stage> ]
+		   [ -r ] [ -t <walltime_per_stage> ] [ -y ]
              ${progname} -h
      
       -a <account>, --account=<account>
@@ -36,16 +37,29 @@ function print_help_and_exit {
       -d, --data-fabric
 
             Transfer the results of each stage to the NeSI Data Fabric upon
-	    that stage's successful completion.
+            that stage's successful completion.
       
       -e, --email=<email_address>
       
             The email address to which to send job notifications. If not
-	    provided, no job notifications will be sent by the scheduler.
+            provided, no job notifications will be sent by the scheduler.
+
+      -f, --first-stage=<num>
+
+            The first stage of this simulation to run. This is primarily
+	    intended for restarting simulations that have crashed or otherwise
+	    failed. It can be used in conjunction with -r, but doesn't have
+	    to be (for instance, if you wish to resume from the very start
+	    of the specified stage).
 
       -h, --help
 
             Print this help and exit.
+      
+      -k, --cores=<num_cores>
+
+            Number of cores to request for each step. Must be a multiple
+            of 16. The default is 16.
       
       -m, --mem-per-cpu=<memory>
       
@@ -66,6 +80,11 @@ function print_help_and_exit {
 
             Tell the script how long you want each stage to be run for (the
             maximum wall time). The default is 48 hours.
+      
+      -y, --hybrid
+
+            Use hybrid (OpenMP + MPI) parallelism. Default is no (i.e., MPI
+	    parallelism only).
 
 ENDHELP
 }
@@ -145,30 +164,38 @@ function write_shell_script_component {
 	# If this is any stage (including the first and the last), copy the output
 	# files from the *previous* stage. In all stages, grompp and mdrun_mpi will
 	# also be run.
+	
+	grompp_args="-f md_prod_$1.mdp -c $2.gro -p ${topology_base} -o $1.tpr"
+	mdrun_args="-pin on -noconfout -cpt 15 -cpo $1.cpt -s $1.tpr -o $1.trr -c $1.gro -e $1.edr -g $1.log -v"
+	# Only do this for the first simulation stage
+	if ${restart_stage}
+	then
+		mdrun_args="${mdrun_args} -cpi $1.cpt"
+		restart_stage=false
+	fi
+	if ${hybrid}
+	then
+		mdrun_args="-ntomp 16 ${mdrun_args}"
+	fi
 
 	cat << EOSS
 
 module load GROMACS/4.6.5-intel-2015a-hybrid
 
-srun grompp \\
-	-f md_prod_$1.mdp \\
-	-c $2.gro \\
-	-p ${topology_base} \\
-	-o $1.tpr && \\
+thisdir=\$(pwd -P)
+
+echo "Copying input data to \${CHK_DIR} ..." && \\
+cp $2.gro ${topology_base} \${CHK_DIR} && \\
+cd \${CHK_DIR} && \\
+srun grompp ${grompp_args} && \\
 echo "Note: Simulation logs will be written to $1.log" && \\
-srun mdrun_mpi \\
-	-s $1.tpr \\
-	-o $1.trr \\
-	-c $1.gro \\
-	-e $1.edr \\
-	-g $1.log \\
-	-v        \\
+srun mdrun_mpi ${mdrun_args} && \\
+cp -arv $1.tpr $1.trr $1.gro $1.edr $1.log \${thisdir} && \\
+cd \${thisdir} && \\
+rm -rv \${CHK_DIR}/* && \\
 EOSS
 	if ${data_fabric}
 	then
-		cat << EOSS
-	&& \\
-EOSS
 		# On the first stage, set up an iRODS directory
 		# on the Data Fabric
 		if [ $3 -eq 1 ]
@@ -240,6 +267,11 @@ cat << EOTFR >> ${tfrcmd}
 ${iput_command} $2.gro \${df_dest_dir}
 EOTFR
 EOSS
+	else
+		cat << EOSS
+true
+EOSS
+	fi
 }
 
 function write_slurm_component {
@@ -248,7 +280,6 @@ function write_slurm_component {
 	# will, as far as possible, be applied to all jobs.
 	# 
 	# Important ones to be aware of:
-	# - each job will request 4 GB of RAM per task
 	# - you may only run on Sandy Bridge nodes
 	#
 	# Positional parameters:
@@ -258,23 +289,25 @@ function write_slurm_component {
 	cat << EOSLURM
 #!/bin/bash
 
-#SBATCH --job-name      ${jobprefix}_$1
-#SBATCH --account       ${account}
-#SBATCH --time          ${walltime}
-#SBATCH --ntasks        8
-#SBATCH --cpus-per-task 1
-#SBATCH --mem-per-cpu   ${mem_per_cpu}
-#SBATCH --constraint    sb 
-#SBATCH --output        $1.out
-#SBATCH --error         $1.err
+#SBATCH --job-name        ${jobprefix}_$1
+#SBATCH --account         ${account}
+#SBATCH --time            ${walltime}
+#SBATCH --ntasks          ${tasks}
+#SBATCH --nodes           ${nodes}
+#SBATCH --ntasks-per-node $((tasks/nodes))
+#SBATCH --cpus-per-task   ${cpus_per_task}
+#SBATCH --mem-per-cpu     ${mem_per_cpu}
+#SBATCH --constraint      sb 
+#SBATCH --output          $1.out
+#SBATCH --error           $1.err
 EOSLURM
 	if [ -n "${email_address}" ]
 	then
-		echo "#SBATCH --mail-type     ALL"
-		echo "#SBATCH --mail-user     ${email_address}"
+		echo "#SBATCH --mail-type       ALL"
+		echo "#SBATCH --mail-user       ${email_address}"
 	if [ "$1" != "stage001" ]
 	then
-		echo "#SBATCH --dependency    afterok:$2"
+		echo "#SBATCH --dependency      afterok:$2"
 	fi
 }
 
@@ -293,12 +326,16 @@ progname=$(basename $0)
 # Set some default values
 currdir=$(pwd -P)
 datafabric=false
+hybrid=false
+restart_stage=false
 jobprefix=""
+cores=16
 mem_per_cpu="4G"
 numstages=1
+first_stage=1
 walltime="48:00:00"
 
-ARGS=$(getopt -o a:c:de:hm:n:p:t: -l "account:,coordinates:,data-fabric,email:,help,mem-per-cpu:,num-stages:,topology:,walltime:" -n "${progname}" -- "$@");
+ARGS=$(getopt -o a:c:de:f:hk:m:n:p:rt:y -l "account:,coordinates:,data-fabric,email:,first-stage:,help,cores:,mem-per-cpu:,num-stages:,topology:,restart,walltime:,hybrid" -n "${progname}" -- "$@");
 
 #Bad arguments
 if [ $? -ne 0 ]
@@ -330,6 +367,7 @@ do
 	-d|--data-fabric)
 		shift
 		data_fabric=true
+		;;
 	-e|--email)
 		shift
 		if [ -n "$1" ]
@@ -337,10 +375,24 @@ do
 			email_address=$1
 			shift
 		fi
+	-f|--first-stage)
+		shift
+		if [ -n "$1" ]
+		then
+			first_stage=$1
+			shift
+		fi
 	-h|--help)
 		shift
 		print_help_and_exit
 		;;
+	-k|--cores)
+		shift
+		if [ -n "$1" ]
+		then
+			cores=$1
+			shift
+		fi
 	-m|--mem-per-cpu)
 		shift
 		if [ -n "$1" ]
@@ -364,6 +416,10 @@ do
 			shift
 		fi
 		;;
+	-r|--restart)
+		shift
+		restart_stage=true
+		;;
 	-t|--walltime)
 		shift
 		if [ -n "$1" ]
@@ -371,6 +427,10 @@ do
 			walltime=$1
 			shift
 		fi
+		;;
+	-y|--hybrid)
+		shift
+		hybrid=true
 		;;
 	--)
 		shift
@@ -395,10 +455,46 @@ then
 	exit 1
 fi
 
+# If the first stage is not a positive integer <= numstages, die.
+if [ ${first_stage} -gt ${numstages} ] || [ ${first_stage} -le 0 ]
+then
+	/bin/echo "${progname}: first stage should be a positive integer <= numstages" >&2
+	exit 1
+fi
+
 # If the walltime is not of an acceptable format, die.
 if [[ ! "${walltime}" =~ ([0-9]+-)?[0-9]+:[0-9][0-9]:[0-9][0-9] ]]
 then
 	/bin/echo "${progname}: wall time should be of the form hhh:mm:ss or ddd-hhh:mm:ss" >&2
+	exit 1
+fi
+
+if (( ${cores} % 16 == 0 ))
+then
+	nodes=$((cores/16))
+	if ${hybrid}
+	then
+		tasks=$((cores/16))
+		cpus_per_task=16
+	else
+		tasks=${cores}
+		cpus_per_task=1
+	fi
+else
+	/bin/echo "${progname}: number of cores should be a multiple of 16" >&2
+	exit 1
+fi
+
+if [[ ! "${mem_per_cpu}" =~ [0-9]+[KMGT]?B? ]]
+then
+	/bin/echo "${progname}: memory per CPU should be of the form #, #<B|K|M|G|T>" >&2
+	/bin/echo "or #<KB|MB|GB|TB>" >&2
+	exit 1
+fi
+
+if [[ -n "${email_address}" && ! "${email_address}" =~ .+@.+ ]]
+then
+	/bin/echo "${progname}: ${email_address}: not a valid email address" >&2
 	exit 1
 fi
 
@@ -437,10 +533,10 @@ fi
 iput_command="iput -N 4 -K -P -V"
 
 # Set the full path, the job name, and make a directory
-# called "Production" in the working directory.
-# This means any existing "Production" directory should be checked
+# called "production" in the working directory.
+# This means any existing "production" directory should be checked
 # to make sure nothing important will be used or overwritten inappropriately.
-workdir="${currdir}/Production"
+workdir="${currdir}/production"
 tfrcmd="${workdir}/transfer_script"
 rm -f "${tfrcmd}"
 
@@ -476,9 +572,14 @@ topology_base=$(/bin/basename ${topology})
 /bin/ln -s "${coordinates_full}" "${workdir}/stage000.gro"
 /bin/ln -s "${topology_full}" "${workdir}/${topology_base}"
 
+# Ensure that jobs are submitted from within the specified working directory
+# (this has important implications for where output will be copied back to)
+cd "${workdir}"
+
 prevjobid=0
-prevstagename="stage000"
-for i in $(/usr/bin/seq 1 ${numstages})
+prevstageid=$((first_stage-1))
+prevstagename=$(/usr/bin/printf "stage%03d\n" ${prevstageid})
+for i in $(/usr/bin/seq ${first_stage} ${numstages})
 do
 	stagename=$(/usr/bin/printf "stage%03d\n" $i)
 	jobfile="${workdir}/${stagename}.sl"
@@ -497,3 +598,6 @@ do
 	fi
 	prevstagename="${stagename}"
 done
+
+# Return to the starting directory, just because it's good practice
+cd "${currdir}"
