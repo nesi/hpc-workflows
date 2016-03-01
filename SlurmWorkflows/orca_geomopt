@@ -1,0 +1,417 @@
+#!/usr/bin/env python
+
+"""A script to optimise the geometry of a chemical system in ORCA
+on an HPC system, by breaking the geometry optimisation up into
+a series of small steps.
+
+Written by Benjamin Roberts, Landcare Research (NZ) Ltd, 2016."""
+
+import getopt
+import sys, os
+from subprocess import PIPE,Popen
+import re
+
+class ArgumentError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+class InputError(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+def usage_terse():
+    print """usage: {0} -A <string> -j <string> -x <filename.xyz> [ -c <int> ]
+             [ -e <string> ] [ -f <int> ] [ -g <filename.gbw> ] [ -m <int> ]
+             [ -n <int> ] [ -s <int> ] [ -t <string> ] inputfile.inp
+
+       {0} -h""".format(os.path.basename(__file__))
+
+def usage_full():
+    print """{0}: Optimise the geometry of a chemical system using ORCA
+
+
+      COMPULSORY FLAGS
+
+      -A <string>, --account=<string>
+            The account code to use for HPC job submission purposes. This flag
+            is compulsory and has no default value; the user must choose an
+            account when running this script.
+
+      -j <string>, --job-prefix=<string>
+            A string of no more than six (6) characters to start job names off
+            with, the rest of the job name being "_stage###". This allows for
+            easy identification of the job in the queueing system.
+
+      -x <string>, --coordinates=<string>
+            An XYZ format file containing the initial coordinates of the
+            chemical system. Please note that this script is designed around
+            the coordinates being supplied in an XYZ file that is separate
+            from the ORCA input (*.inp) file, and the XYZ file must be
+            specified by the user.
+
+
+      OPTIONAL FLAGS
+
+      -c <int>, --num-cores=<int>
+            The number of CPU cores to request for each optimisation job. For
+            simplicity, all jobs will use the same number of cores. Default 1.
+            For the sake of efficiency, the maximum allowed value is 16.
+
+      -e <string>, --email=<string>
+            The email address, if desired, to which to send job notifications.
+
+      -f <int>, --first-stage=<int>
+            The stage at which to start. Note that if you set this to greater
+            than 1, it will be assumed that all necessary parts of the output
+            from the preceding stage, notably input coordinates and a GBW file,
+            are present in the working directory. For example, if you use
+            "-f 34" on the command line, the script will expect files
+            stage033.gbw and stage033.xyz to be present in the working
+            directory. However, the names of the input coordinates and GBW
+            file for this new stage can still be overridden using the -x and
+            -g flags respectively. Also, this flag, if given an argument
+            greater than 1, will alter the meaning of the -n flag.
+
+      -g <string>, --gbw-file=<string>
+            The name of an ORCA GBW (Geometry-Basis-Wavefunction) file from
+            which to read in molecular orbital information on the first stage.
+            If no such file is specified, initial molecular orbitals will be
+            calculated.
+
+      -m <int>, --memory-per-core=<int>
+            The amount of memory (RAM) to request per core, measured in GB.
+            For technical reasons, we restrict this value to no more than 7.
+            Default 1.
+
+      -n <int>, --num-stages=<int>
+            The maximum number of optimisation stages to be scheduled (default
+            1).
+            
+            Note that the workflow will terminate once the optimisation
+            converges, even if more stages were scheduled.
+            
+            Note also that if the optimisation is being started at a stage
+            greater than 1 (using the -f flag, q.v.), the stages already run
+            will count towards the total, so that if, for example, the
+            arguments "-f 51" and "-n 100" are used together, a maximum of 50
+            new stages will be run, for a grand total of 100 stages.
+
+      -s <int>, --steps-per-stage=<int>
+            The maximum number of optimisation steps per stage (default 1).
+
+      -t <string>, --max-walltime-per-stage=<string>
+            The maximum walltime to request from the scheduler for each
+            optimisation stage (default 01:00:00, that is, one hour).
+            Acceptable time formats are those accepted by Slurm.
+
+      -h, --help
+            Print this help and exit.
+""".format(os.path.basename(__file__))
+
+def main():
+    try:
+        opts, args = getopt.gnu_getopt(
+                sys.argv[1:],
+                "A:c:e:f:g:hj:m:n:s:t:x:",
+                [
+                    "account=",
+                    "num-cores=",
+                    "email=",
+                    "first-stage",
+                    "gbw-file=",
+                    "help",
+                    "job-prefix=",
+                    "memory-per-core=",
+                    "num-stages=",
+                    "steps-per-stage=",
+                    "max-walltime-per-stage=",
+                    "coordinates="
+                ]
+        )
+    except getopt.GetoptError as err:
+        # print help information and exit:
+        print str(err) # will print something like "option -a not recognized"
+        usage_terse()
+        sys.exit(2)
+
+    account = None
+    email = None
+    firststage = 1
+    gbwfile = None
+    jobprefix = None
+    mempercore = 1
+    numcores = 1
+    numstages = 1
+    stepsperstage = 1
+    walltime = "01:00:00"
+    initcoords = None
+    for flag, flagarg in opts:
+        if flag in ("-h", "--help"):
+            usage_full()
+            sys.exit()
+        elif flag in ("-A", "--account"):
+            account = flagarg
+        elif flag in ("-c", "--num-cores"):
+            numcores = int(flagarg)
+        elif flag in ("-e", "--email"):
+            email = flagarg
+        elif flag in ("-f", "--first-stage"):
+            firststage = int(flagarg)
+            if firststage > 1:
+                prevstagestring = str(firststage-1).zfill(3)
+                if not gbwfile:
+                    gbwfile = "stage{0}.gbw".format(prevstagestring)
+                if not initcoords:
+                    initcoords = "stage{0}.xyz".format(prevstagestring)
+        elif flag in ("-g", "--gbw-file"):
+            gbwfile = flagarg
+        elif flag in ("-j", "--job-prefix"):
+            jobprefix = flagarg
+        elif flag in ("-m", "--memory-per-core"):
+            mempercore = int(flagarg)
+        elif flag in ("-n", "--num-stages"):
+            numstages = int(flagarg)
+        elif flag in ("-s", "--steps-per-stage"):
+            stepsperstage = int(flagarg)
+        elif flag in ("-t", "--max-walltime-per-stage"):
+            walltime = flagarg
+        elif flag in ("-x", "--coordinates"):
+            initcoords = flagarg
+        else:
+            assert False, "unhandled command-line flag"
+
+    # Exit if more than the input file has been supplied as an argument, or
+    # if no input at all has been supplied
+    if len(args) != 1:
+        usage_terse()
+        sys.exit(2)
+
+    if not initcoords:
+        raise ArgumentError("Please use -x or --coordinates to specify an XYZ file containing initial coordinates.")
+    elif not os.path.isfile(initcoords):
+        raise ArgumentError("{0}: not a file".format(initcoords))
+
+    if gbwfile and not os.path.isfile(gbwfile):
+        raise ArgumentError("{0}: not a file".format(gbwfile))
+
+    if not account:
+        raise ArgumentError("Please use -A or --account to specify an account code for job submission purposes.")
+
+    if not jobprefix:
+        raise ArgumentError("Please use -j or --job-prefix to specify a job name prefix.")
+    elif len(jobprefix) > 6:
+        raise ArgumentError("For technical reasons, the job name prefix must be at most six characters long.")
+
+    if numstages > 999 or numstages < 1:
+        raise ArgumentError("For technical reasons, the number of optimisation stages must be between 1 and 999.")
+
+    if firststage > 999 or firststage < 1:
+        raise ArgumentError("For technical reasons, the first optimisation stage must be between 1 and 999.")
+
+    if numcores > 16 or numcores < 1:
+        raise ArgumentError("For technical reasons, the number of cores must be between 1 and 16.")
+
+    if not re.match(r'(\d+-)?\d+(:\d+(:\d+)?)?$', walltime):
+        raise ArgumentError("Invalid walltime specification: {0}".format(walltime))
+
+    inputfile = args[0]
+    outputtext = []
+
+    numxyzfiles = 0
+    printnprocs = True
+    with open(inputfile, 'r') as ifh:
+        for line in ifh:
+            # Remove trailing whitespace from lines
+            strippedline = line.rstrip()
+            # Deal with various sections
+            if re.match(r'\s*\*\s+xyzfile', strippedline):
+                numxyzfiles += 1
+                if numxyzfiles > 1:
+                    raise InputError("Too many starting geometry specifications")
+                else:
+                    if printnprocs:
+                        outputtext.append("%pal nprocs {0}".format(numcores))
+                        outputtext.append("     end")
+                        outputtext.append("")
+                    (star, keyword, charge, mult, xyzname) = strippedline.split()
+                    outputtext.append("%geom MaxIter {0}".format(stepsperstage))
+                    outputtext.append("      end")
+                    outputtext.append("")
+            elif re.match(r'\s*\*', strippedline):
+                raise InputError("Geometry input is expected to be from an XYZ file")
+            else:
+                nprocsre = re.compile(r'(\s*%pal\s+nprocs\s+)(\d+)', re.I)
+                geomre = re.compile(r'\s*%geom', re.I)
+                if nprocsre.match(strippedline):
+                    strippedline = nprocsre.sub(r'\g<1>%d' % numcores, strippedline)
+                    printnprocs = False
+                elif geomre.match(strippedline):
+                    print "Warning: A %geom section already exists. Bad behaviour may occur."
+                outputtext.append(strippedline)
+
+    # Set a starting value for previous job ID
+    prevjobid = None
+    prevlogname = None
+
+    for i in range(firststage-1, numstages):
+        currstage = i + 1
+        istring = str(i).zfill(3)
+        currstagestring = str(currstage).zfill(3)
+
+        # Determine names for current and previous GBW files
+        pgfn = None
+        moread = False
+        if currstage != firststage or gbwfile:
+            moread = True
+            if currstage != firststage:
+                pgfn = "stage{0}.gbw".format(istring)
+            else:
+                pgfn = gbwfile
+
+        # Determine name for previous coordinate file
+        if currstage == firststage:
+            pcfn = initcoords
+        else:
+            pcfn = "stage{0}.xyz".format(istring)
+
+        orcafilename = "stage{0}.inp".format(currstagestring)
+        slurmfilename = "stage{0}.sl".format(currstagestring)
+        with open(orcafilename, 'w') as ofh:
+            keywords = False
+            for line in outputtext:
+                if re.match(r'\s*!', line):
+                    keywords = True
+                else:
+                    if keywords and moread:
+                        ofh.write("! moread\n")
+                        ofh.write("%moinp \"{0}\"\n".format(pgfn))
+                    keywords = False
+                ofh.write("{0}\n".format(line))
+            ofh.write("* xyzfile {0} {1} {2}\n".format(charge, mult, pcfn))
+
+        with open(slurmfilename, 'w') as sfh:
+            sfh.write("""#!/bin/bash
+
+#SBATCH --job-name       {jobprefix}_stage{currstagestring}
+#SBATCH --account        {account}
+#SBATCH --time           {walltime}
+#SBATCH --ntasks         {numcores}
+#SBATCH --mem-per-cpu    {mempercore}G
+#SBATCH --output         {jobprefix}_stage{currstagestring}.%j.out
+#SBATCH --error          {jobprefix}_stage{currstagestring}.%j.err
+""".format(
+                    jobprefix=jobprefix,
+                    currstagestring=currstagestring,
+                    account=account,
+                    walltime=walltime,
+                    numcores=numcores,
+                    mempercore=mempercore
+                )
+            )
+
+            if email:
+                sfh.write("""#SBATCH --mail-user      {email}
+#SBATCH --mail-type      ALL\n""".format(email=email))
+
+            if prevjobid:
+                sfh.write("#SBATCH --dependency     afterok:{prevjobid}\n".format(prevjobid=prevjobid))
+
+            sfh.write("""
+exitcode=0
+""")
+
+            if prevlogname:
+                sfh.write("""
+grep \"THE OPTIMIZATION HAS CONVERGED\" {prevlogname}
+if [ $? -eq 0 ]
+then
+\texit 0
+fi
+
+grep \"The optimization did not converge\" {prevlogname} > /dev/null
+if [ $? -ne 0 ]
+then
+\techo \"Error: The previous calculation did not report failure, but nor did it\" >&2
+\techo \"       state whether the optimisation did or did not converge. Please\" >&2
+\techo \"       review its output for possible errors.\" >&2
+\techo \"\" >&2
+\techo \"Log file: {prevlogname}\" >&2
+\texit 1
+fi
+""".format(prevlogname=prevlogname))
+
+            sfh.write("""
+thisdir=$(pwd -P) && \\
+workdir=\"${{CHK_DIR}}/${{SLURM_JOB_NAME}}-${{SLURM_JOB_ID}}\" && \\
+mkdir -p \"${{workdir}}\"
+if [ $? -ne 0 ]
+then
+\techo "Could not create or go to working directory" >&2
+\texitcode=1
+\texit ${{exitcode}}
+fi
+
+module load ORCA/3_0_3-linux_x86-64 && \\
+orca_exe=$(which orca)
+if [ $? -ne 0 ]
+then
+\techo "Unable to load ORCA module or find ORCA executable" >&2
+\texitcode=1
+\texit ${{exitcode}}
+fi
+
+inputfile=\"{inputfile}\" && \\
+inputbase=$(basename \"${{inputfile}}\") && \\
+coordfile=\"{coordfile}\" && \\
+coordbase=$(basename \"${{coordfile}}\") && \\
+""".format(inputfile=orcafilename, coordfile=pcfn))
+
+            # Copy the GBW file if there is one
+            if pgfn:
+                sfh.write("""gbwfile=\"{gbwfile}\" && \\
+gbwbase=$(basename \"${{gbwfile}}\") && \\
+cp -arv \"${{gbwfile}}\" \"${{workdir}}/.\" && \\\n""".format(gbwfile=pgfn))
+            
+            sfh.write("""cp -arv \"${{inputfile}}\" \"${{coordfile}}\" \"${{workdir}}/.\" && \\
+cd \"${{workdir}}\"
+if [ $? -ne 0 ]
+then
+\techo "Unable to copy input files or go to working directory" >&2
+\texitcode=1
+\texit ${{exitcode}}
+fi
+
+${{orca_exe}} \"${{inputbase}}\"
+exitcode=$?
+if [ ${{exitcode}} -ne 0 ]
+then
+\techo "ORCA execution failed -- check log for details" >&2
+fi
+
+rm -rv *.tmp \"${{inputbase}}\" \"${{coordbase}}\"\n""".format(inputfile=orcafilename, coordfile=pcfn))
+            
+            if pgfn:
+                sfh.write("rm -rv \"${gbwbase}\"\n")
+
+            sfh.write("""
+# Copy all remaining files back to the starting directory, removing them from
+# the working directory if the copy succeeds
+for file in *
+do
+\tcp -arv \"${file}\" \"${thisdir}\" && rm -rv \"${file}\"
+done
+
+cd \"${thisdir}\"
+
+exit ${exitcode}\n""")
+
+        # Get the result of job submission
+        # Don't do this inside the preceding "with" as the file must be closed
+        sbatch = Popen(['sbatch', slurmfilename], stdout=PIPE)
+        prevjobid = sbatch.communicate()[0].split()[3]
+        prevlogname = "{0}_stage{1}.{2}.out".format(jobprefix, currstagestring, prevjobid)
+
+        print "Submitted optimisation stage {0} of {1} with a job ID of {2}".format(currstage, numstages, prevjobid)
+
+if __name__ == '__main__':
+    main()

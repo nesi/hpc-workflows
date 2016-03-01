@@ -1,0 +1,11 @@
+/file/set-batch-options no yes yes no 
+/file/start-transcript "fluid_flow.trn" 
+/file/read-case-data "fluid_flow.cas.gz" 
+/mesh/reorder/reorder-zones 
+/mesh/reorder/reorder-domain 
+
+(sc-solve)
+
+file w-c-d FluentRestart.cas.gz
+exit
+ok
